@@ -55,6 +55,7 @@ from .rollout_mixin import DataType, RolloutTrainerMixin
 from .utils import (_ForwardRedirection, compute_chord_loss, get_even_process_data, identity_data_collator,
                     load_pil_img, make_chord_sft_dataset, pad_logps_back_to_batch, patch_profiling_context,
                     patch_profiling_decorator, patch_save_last_checkpoint, replace_assistant_response_with_ids)
+from .pair_sampler import PairRepeatSampler #EDITED
 
 try:
     from trl.trainer.utils import entropy_from_logits
@@ -170,8 +171,62 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 shuffle=self.shuffle_dataset,
                 seed=self.args.seed,
             )
+
+        td = train_dataset or self.train_dataset
+
+        # detect pairwise dataset format
+        use_pair_sampler = False
+        cols = getattr(td, "column_names", None)
+        if cols is not None:
+            use_pair_sampler = ("pair_id" in cols) and ("side" in cols) and ("preferred_side" in cols)
         else:
-            return super()._get_train_sampler(train_dataset)
+            try:
+                ex = td[0]
+                use_pair_sampler = (
+                    isinstance(ex, dict)
+                    and ("pair_id" in ex)
+                    and ("side" in ex)
+                    and ("preferred_side" in ex)
+                )
+            except Exception:
+                use_pair_sampler = False
+
+        if use_pair_sampler:
+            if self.accelerator.is_main_process:
+                logger.info("✅ Using PairRepeatSampler for BT pairing (pair_id/side).")
+
+            # Need an even number of prompt-groups: (side0 K times) + (side1 K times)
+            two_prompt_group = 2 * self.num_generations
+            if self.args.generation_batch_size % two_prompt_group != 0:
+                raise ValueError(
+                    f"generation_batch_size={self.args.generation_batch_size} must be a multiple of "
+                    f"2*num_generations={two_prompt_group} for BT pairing."
+                )
+
+            local_gbs = self.args.generation_batch_size
+            if self.accelerator.num_processes > 1 and (self.args.generation_batch_size % self.accelerator.num_processes == 0):
+                local_gbs = self.args.generation_batch_size // self.accelerator.num_processes
+
+            need = 2 * self.num_generations
+            if local_gbs < need or (local_gbs % need != 0):
+                raise ValueError(
+                    f"Per-rank generation batch size must be a multiple of 2*num_generations.\n"
+                    f"world_size={self.accelerator.num_processes}, num_generations={self.num_generations}\n"
+                    f"global_gbs={self.args.generation_batch_size}, inferred_local_gbs={local_gbs}, need multiple of {need}"
+                )
+
+
+            return PairRepeatSampler(
+                data_source=td,
+                mini_repeat_count=self.num_generations,
+                shuffle=self.shuffle_dataset,
+                seed=self.args.seed,
+                rank=self.accelerator.process_index,
+                world_size=self.accelerator.num_processes,
+            )
+
+        return super()._get_train_sampler(train_dataset)
+
 
     @patch_profiling_decorator
     def _prepare_inputs(self, generation_batch: Dict[str, Union[torch.Tensor,
